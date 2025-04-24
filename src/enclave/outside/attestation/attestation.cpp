@@ -1,5 +1,5 @@
 #include <conf/FaasmConfig.h>
-#include <enclave/outside/attestation/AzureAttestationServiceClient.h>
+#include <enclave/outside/attestation/AttestationServiceClient.h>
 #include <enclave/outside/attestation/attestation.h>
 #include <enclave/outside/ecalls.h>
 #include <faabric/util/logging.h>
@@ -107,20 +107,9 @@ EnclaveInfo generateQuote(int enclaveId,
 void validateQuote(const EnclaveInfo& enclaveInfo,
                    const std::string& attestationProviderUrl)
 {
-    AzureAttestationServiceClient client(attestationProviderUrl);
+    AttestationServiceClient client(attestationProviderUrl);
 
     // Send enclave quote to remote attestation service for validation
     std::string jwtResponse = client.attestEnclave(enclaveInfo);
-
-    // Validate JWT response token
-    client.validateJwtToken(jwtResponse);
 }
-
-#ifdef FAASM_SGX_HARDWARE_MODE
-void attestEnclave(int enclaveId, std::vector<uint8_t> enclaveHeldData)
-{
-    EnclaveInfo enclaveInfo = generateQuote(enclaveId, enclaveHeldData);
-    validateQuote(enclaveInfo, conf::getFaasmConfig().attestationProviderUrl);
-}
-#endif
 }

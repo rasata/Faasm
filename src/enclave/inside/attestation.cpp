@@ -1,9 +1,11 @@
 #include <enclave/inside/EnclaveWasmModule.h>
+#include <enclave/inside/crypto/base64.h>
 #include <enclave/inside/native.h>
 
 #include <memory>
 
 #include <sgx_report.h>
+#include <sgx_tcrypto.h>
 #include <sgx_utils.h>
 
 namespace sgx {
@@ -21,10 +23,9 @@ namespace sgx {
 //
 // TODO:
 // 1. can we cache the JWT we get here? At least surely the SGX report
-// 2. Need to configure MAA to sign something using the public key we provide
-static void tless_get_attestation_jwt_wrapper(wasm_exec_env_t execEnv,
-                                              int32_t* jwtPtrPtr,
-                                              int32_t* jwtSizePtr)
+static void accless_get_attestation_jwt_wrapper(wasm_exec_env_t execEnv,
+                                                int32_t* jwtPtrPtr,
+                                                int32_t* jwtSizePtr)
 {
     auto* wasmModule = wasm::getExecutingEnclaveWasmModule(execEnv);
     SPDLOG_DEBUG_SGX("Generating TEE certificate for enclave %s/%s",
@@ -105,17 +106,105 @@ static void tless_get_attestation_jwt_wrapper(wasm_exec_env_t execEnv,
         return;
     }
 
-    assert(jwtResponseSize == wasmModule->dataXferSize);
+    size_t pubKeySize = wasmModule->dataXferSize - jwtResponseSize;
+    std::string jweBase64(wasmModule->dataXferPtr,
+                          wasmModule->dataXferPtr + jwtResponseSize);
+    std::string serverPubKeyBase64(
+      (const char*)(wasmModule->dataXferPtr + jwtResponseSize),
+      wasmModule->dataXferSize + jwtResponseSize + pubKeySize);
+
+    // Decode the ephemeral server pub key
+    auto serverPubKeyRaw = base64Decode(serverPubKeyBase64);
+    FaasmPublicKey serverPubKey;
+    memcpy(serverPubKey.gx, serverPubKeyRaw.data(), 32);
+    memcpy(serverPubKey.gy, serverPubKeyRaw.data() + 32, 32);
+
+    // Derive the decryption key from the server pub key
+    sgx_ec256_dh_shared_t jwtDerivedSharedKey;
+    auto privKey = wasmModule->getPrivKey();
+    auto keyContext = wasmModule->getKeyContext();
+    sgx_status_t status = sgx_ecc256_compute_shared_dhkey(
+      &privKey, &serverPubKey, &jwtDerivedSharedKey, keyContext);
+    if (status != SGX_SUCCESS) {
+        if (status == SGX_ERROR_INVALID_PARAMETER) {
+            SPDLOG_ERROR_SGX("Remote public key not a valid point in curve");
+        } else if (status == SGX_ERROR_UNEXPECTED) {
+            SPDLOG_ERROR_SGX("Error during key creation process");
+        } else {
+            SPDLOG_ERROR_SGX(
+              "Error deriving shared key after key exchange: unreachable!");
+        }
+        auto exc =
+          std::runtime_error("Error deriving shared key after key exchange");
+        wasmModule->doThrowException(exc);
+    }
+    // Reverse the shared key to match the endianness of the Rust server
+    std::reverse(std::begin(jwtDerivedSharedKey.s),
+                 std::end(jwtDerivedSharedKey.s));
+
+    // Decrypt the JWE into a JWT
+    auto jweRaw = base64Decode(jweBase64);
+    if (jweRaw.size() < SGX_AESGCM_IV_SIZE + SGX_AESGCM_MAC_SIZE) {
+        SPDLOG_ERROR_SGX("JWE is not large enough (size: %zu)", jweRaw.size());
+        auto exc = std::runtime_error("JWE not large enough");
+        wasmModule->doThrowException(exc);
+    }
+
+    const uint8_t* iv = jweRaw.data();
+    const uint8_t* cipherText = jweRaw.data() + SGX_AESGCM_IV_SIZE;
+    size_t cipherTextLen =
+      jweRaw.size() - SGX_AESGCM_IV_SIZE - SGX_AESGCM_MAC_SIZE;
+    const sgx_aes_gcm_128bit_tag_t* tag =
+      reinterpret_cast<const sgx_aes_gcm_128bit_tag_t*>(
+        jweRaw.data() + jweRaw.size() - SGX_AESGCM_MAC_SIZE);
+    // Must truncate the shared key
+    sgx_aes_gcm_128bit_key_t aesKey;
+    memcpy(aesKey, jwtDerivedSharedKey.s, sizeof(sgx_aes_gcm_128bit_key_t));
+
+    std::vector<uint8_t> plainText(cipherTextLen, 0);
+    status =
+      sgx_rijndael128GCM_decrypt(&aesKey,
+                                 cipherText,
+                                 static_cast<uint32_t>(cipherTextLen),
+                                 plainText.data(),
+                                 iv,
+                                 static_cast<uint32_t>(SGX_AESGCM_IV_SIZE),
+                                 nullptr,
+                                 0,
+                                 tag);
+    if (status != SGX_SUCCESS) {
+        if (status == SGX_ERROR_INVALID_PARAMETER) {
+            if (cipherText == nullptr || iv == nullptr || tag == nullptr) {
+                SPDLOG_ERROR_SGX(
+                  "Error decrypting JWE: null-pointing argument");
+            } else if (cipherTextLen < 1) {
+                SPDLOG_ERROR_SGX(
+                  "Error decrypting JWE: non-positive length ciphertext");
+            } else {
+                SPDLOG_ERROR_SGX(
+                  "Error decrypting JWE: other invalid parameter");
+            }
+        } else if (status == SGX_ERROR_MAC_MISMATCH) {
+            SPDLOG_ERROR_SGX("Error decrypting JWE: MAC missmatch");
+        } else if (status == SGX_ERROR_UNEXPECTED) {
+            SPDLOG_ERROR_SGX("Error decrypting JWE: decryption failed");
+        } else {
+            SPDLOG_ERROR_SGX("Error decrypting JWE: other");
+        }
+        auto exc = std::runtime_error("Error decrypting JWE");
+        wasmModule->doThrowException(exc);
+    }
+    std::string jwt(plainText.begin(), plainText.end());
 
     // Copy JWT into heap-allocated WASM buffer
     void* nativePtr = nullptr;
-    auto wasmOffset = wasmModule->wasmModuleMalloc(jwtResponseSize, &nativePtr);
+    auto wasmOffset = wasmModule->wasmModuleMalloc(jwt.size(), &nativePtr);
     if (wasmOffset == 0 || nativePtr == nullptr) {
         SPDLOG_ERROR_SGX("Error allocating memory in WASM module");
         auto exc = std::runtime_error("Error allocating memory in module!");
         wasmModule->doThrowException(exc);
     }
-    std::memcpy(nativePtr, wasmModule->dataXferPtr, jwtResponseSize);
+    std::memcpy(nativePtr, jwt.c_str(), jwt.size());
 
     free(wasmModule->dataXferPtr);
     wasmModule->dataXferPtr = nullptr;
@@ -130,9 +219,9 @@ static void tless_get_attestation_jwt_wrapper(wasm_exec_env_t execEnv,
     *newJwtSizePtr = jwtResponseSize;
 }
 
-static void tless_get_mrenclave_wrapper(wasm_exec_env_t execEnv,
-                                        int32_t* buf,
-                                        int32_t bufSize)
+static void accless_get_mrenclave_wrapper(wasm_exec_env_t execEnv,
+                                          int32_t* buf,
+                                          int32_t bufSize)
 {
     auto* wasmModule = wasm::getExecutingEnclaveWasmModule(execEnv);
 
@@ -154,17 +243,17 @@ static void tless_get_mrenclave_wrapper(wasm_exec_env_t execEnv,
 }
 
 // This function returns 0 is TLess is enabled
-static int32_t tless_is_enabled_wrapper(wasm_exec_env_t execEnv)
+static int32_t accless_is_enabled_wrapper(wasm_exec_env_t execEnv)
 {
     auto* wasmModule = wasm::getExecutingEnclaveWasmModule(execEnv);
 
-    return wasmModule->isTlessEnabled() ? 0 : 1;
+    return wasmModule->isAcclessEnabled() ? 0 : 1;
 }
 
 static NativeSymbol funcsNs[] = {
-    REG_FAASM_NATIVE_FUNC(tless_get_attestation_jwt, "(**)"),
-    REG_FAASM_NATIVE_FUNC(tless_get_mrenclave, "(*i)"),
-    REG_FAASM_NATIVE_FUNC(tless_is_enabled, "()i"),
+    REG_FAASM_NATIVE_FUNC(accless_get_attestation_jwt, "(**)"),
+    REG_FAASM_NATIVE_FUNC(accless_get_mrenclave, "(*i)"),
+    REG_FAASM_NATIVE_FUNC(accless_is_enabled, "()i"),
 };
 
 uint32_t getFaasmAttestationApi(NativeSymbol** nativeSymbols)
