@@ -4,7 +4,7 @@
 
 set(SGX_DCAP_QUOTE_GENERATION "/opt/intel/sgxdcap/QuoteGeneration")
 set(SGX_DCAP_QUOTE_GENERATION_INCLUDE "${SGX_DCAP_QUOTE_GENERATION}/quote_wrapper")
-set(SGX_DCAP_LIB /usr/lib/libsgx_dcap_ql.so)
+set(SGX_DCAP_LIB sgx_dcap_ql)
 
 add_library(attestation STATIC
     attestation.cpp
@@ -24,7 +24,7 @@ target_link_libraries(attestation
     cppcodec::cppcodec
     jwt-cpp::jwt-cpp
     picojson::picojson
-    RapidJSON::RapidJSON
+    rapidjson
 )
 
 # Quote generation is only supported in hardware mode. Therefore, we only link
