@@ -26,7 +26,7 @@ env:
   FAASMCTL_CONAN_CACHE_MOUNT_SOURCE: ./dev/faasm/conan2
   FAABRIC_VERSION: 0.22.0
   FAASM_INI_FILE: ./faasm.ini
-  FAASM_VERSION: 0.32.0
+  FAASM_VERSION: 0.33.0
   FAASMCTL_VERSION: 0.51.0
 
 jobs:
@@ -34,7 +34,7 @@ jobs:
     if: github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     container:
-      image: ghcr.io/faasm/cli:0.32.0
+      image: ghcr.io/faasm/cli:0.33.0
     steps:
       - name: "Checkout code"
         uses: actions/checkout@v4
@@ -118,7 +118,7 @@ jobs:
     if: ${{ needs.wasm-funcs-cache.outputs.needs-cpp-wasm == 'true' }}
     runs-on: ubuntu-latest
     container:
-      image: ghcr.io/faasm/cpp-sysroot:0.7.0
+      image: ghcr.io/faasm/cpp-sysroot:0.8.0
     steps:
       - name: "Checkout code"
         uses: actions/checkout@v4
@@ -137,7 +137,7 @@ jobs:
           # cache path, and the compression algorithm. We install `zstd` to
           # get the same version hash than in the step that runs outside of
           # the containers
-          apt install -y zstd
+          apt update && apt install -y zstd
           # There's a misalignment between the github.workspace value reported
           # in the `run` command, and the one in the `working-directory` one,
           # so we use the environment variable here instead. See:
@@ -160,7 +160,7 @@ jobs:
     if: ${{ needs.wasm-funcs-cache.outputs.needs-py-wasm == 'true' }}
     runs-on: ubuntu-latest
     container:
-      image: ghcr.io/faasm/cpython:0.4.0
+      image: ghcr.io/faasm/cpython:0.5.0
     steps:
       - name: "Checkout code"
         uses: actions/checkout@v4
@@ -175,7 +175,7 @@ jobs:
       - name: "Prepare Python WASM cache"
         id: submodule-commit
         run: |
-          apt install -y zstd
+          apt update && apt install -y zstd
           git config --global --add safe.directory ${GITHUB_WORKSPACE}
           echo "py-commit=$(git submodule status ./clients/python | cut '-d ' -f 2)" >> $GITHUB_OUTPUT
           # We temporarily move the pyfuncs to only use one cache
@@ -339,7 +339,7 @@ jobs:
         run: |
           # For some reason, non-docker runners resolve /usr into ../../../usr
           sudo chown -R $(id -u):$(id -g) ./dev/faasm-local
-          mv ../../..//usr/local/faasm/wasm ./dev/faasm-local/
+          mv ../../../usr/local/faasm/wasm ./dev/faasm-local/
           mv ./dev/faasm-local/wasm/fake ./dev/faasm-local/runtime_root/lib/fake
           mkdir -p ./dev/faasm-local/shared
           mv ./dev/faasm-local/wasm/python/pyfuncs ./dev/faasm-local/shared/pyfuncs
